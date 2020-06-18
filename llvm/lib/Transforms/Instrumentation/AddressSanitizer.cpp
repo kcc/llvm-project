@@ -307,7 +307,7 @@ static cl::opt<int> ClInstrumentationWithCallsThreshold(
         "If the function being instrumented contains more than "
         "this number of memory accesses, use callbacks instead of "
         "inline checks (-1 means never use callbacks)."),
-    cl::Hidden, cl::init(7000));
+    cl::Hidden, cl::init(0));
 
 static cl::opt<std::string> ClMemoryAccessCallbackPrefix(
     "asan-memory-access-callback-prefix",
