@@ -27,6 +27,7 @@
 #include "sanitizer_common/sanitizer_flags.h"
 #include "sanitizer_common/sanitizer_libc.h"
 #include "sanitizer_common/sanitizer_symbolizer.h"
+#include "sanitizer_common/sanitizer_stackdepot.h"
 #include "lsan/lsan_common.h"
 #include "ubsan/ubsan_init.h"
 #include "ubsan/ubsan_platform.h"
@@ -145,25 +146,81 @@ void __asan_report_ ## type ## _n_noabort(uptr addr, uptr size) {           \
 ASAN_REPORT_ERROR_N(load, false)
 ASAN_REPORT_ERROR_N(store, true)
 
+u64 *memtrace_stack_id_counters = nullptr;
+u64 heap_count, stack_count, other_count;
+
+void MemtraceInit() {
+  Printf("MemtraceInit:\n");
+  u64 one = 1;
+  u64 alloc_count = one << 32;
+  u64 alloc_size = alloc_count * sizeof(*memtrace_stack_id_counters);
+  memtrace_stack_id_counters = (u64 *)MmapOrDie(alloc_size, "memtrace");
+}
+
+void Memtrace(uptr addr) {
+  if (!memtrace_stack_id_counters) return;
+  AsanChunkView chunk = FindHeapChunkByAddress(addr);
+  bool IsHeap = chunk.IsValid();
+  u32 StackID = IsHeap ? chunk.GetAllocStackId() : 0;
+  u64 Cnt = memtrace_stack_id_counters[StackID]++;
+  bool IsStack =
+      !IsHeap && GetCurrentThread() && GetCurrentThread()->AddrIsInStack(addr);
+  if (IsHeap) heap_count++;
+  else if (IsStack) stack_count++;
+  else other_count++;
+
+  if (false &&  (Cnt % 1024) == 0)
+    Printf("ZZZ %p loc: %s id: %u count: %zd\n", addr,
+           IsHeap ? "heap" : (IsStack ? "stack" : "other"), StackID, Cnt);
+}
+
+struct CountedId {
+  u64 Count;
+  u32 Id;
+};
+
+void MemtraceDump() {
+  Printf("MemtraceDump:\n");
+  Printf("heap : %zd\n", heap_count);
+  Printf("stack: %zd\n", stack_count);
+  Printf("other: %zd\n", other_count);
+  InternalMmapVector<CountedId> V;
+  for (u32 Id = 0xffffffff; Id > 0; Id--)
+    if (auto Cnt = memtrace_stack_id_counters[Id])
+      V.push_back({Cnt, Id});
+  Sort(V.begin(), V.size(), [](const CountedId &A, const CountedId &B) {
+    return A.Count > B.Count;
+  });
+  int Idx = 0;
+  for (CountedId &CId : V) {
+    StackTrace ST = StackDepotGet(CId.Id);
+    Printf("[%d] count %zd permile %d\n", Idx++, CId.Count,
+           CId.Count * 1000 / heap_count);
+    ST.Print();
+  }
+}
+
+
 #define ASAN_MEMORY_ACCESS_CALLBACK_BODY(type, is_write, size, exp_arg, fatal) \
-    if (SANITIZER_MYRIAD2 && !AddrIsInMem(addr) && !AddrIsInShadow(addr))      \
-      return;                                                                  \
-    uptr sp = MEM_TO_SHADOW(addr);                                             \
-    uptr s = size <= SHADOW_GRANULARITY ? *reinterpret_cast<u8 *>(sp)          \
-                                        : *reinterpret_cast<u16 *>(sp);        \
-    if (UNLIKELY(s)) {                                                         \
-      if (UNLIKELY(size >= SHADOW_GRANULARITY ||                               \
-                   ((s8)((addr & (SHADOW_GRANULARITY - 1)) + size - 1)) >=     \
-                       (s8)s)) {                                               \
-        if (__asan_test_only_reported_buggy_pointer) {                         \
-          *__asan_test_only_reported_buggy_pointer = addr;                     \
-        } else {                                                               \
-          GET_CALLER_PC_BP_SP;                                                 \
-          ReportGenericError(pc, bp, sp, addr, is_write, size, exp_arg,        \
-                              fatal);                                          \
-        }                                                                      \
+  if (SANITIZER_MYRIAD2 && !AddrIsInMem(addr) && !AddrIsInShadow(addr))        \
+    return;                                                                    \
+  Memtrace(addr);                                                              \
+  return;                                                                      \
+  uptr sp = MEM_TO_SHADOW(addr);                                               \
+  uptr s = size <= SHADOW_GRANULARITY ? *reinterpret_cast<u8 *>(sp)            \
+                                      : *reinterpret_cast<u16 *>(sp);          \
+  if (UNLIKELY(s)) {                                                           \
+    if (UNLIKELY(size >= SHADOW_GRANULARITY ||                                 \
+                 ((s8)((addr & (SHADOW_GRANULARITY - 1)) + size - 1)) >=       \
+                     (s8)s)) {                                                 \
+      if (__asan_test_only_reported_buggy_pointer) {                           \
+        *__asan_test_only_reported_buggy_pointer = addr;                       \
+      } else {                                                                 \
+        GET_CALLER_PC_BP_SP;                                                   \
+        ReportGenericError(pc, bp, sp, addr, is_write, size, exp_arg, fatal);  \
       }                                                                        \
-    }
+    }                                                                          \
+  }
 
 #define ASAN_MEMORY_ACCESS_CALLBACK(type, is_write, size)                      \
   extern "C" NOINLINE INTERFACE_ATTRIBUTE                                      \
@@ -506,6 +563,10 @@ static void AsanInitInternal() {
       else
         Atexit(__lsan::DoRecoverableLeakCheckVoid);
     }
+  }
+  if (GetEnv("MEMTRACE")) {
+    MemtraceInit();
+    Atexit(MemtraceDump);
   }
 
 #if CAN_SANITIZE_UB
